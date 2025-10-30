@@ -123,106 +123,118 @@ local function remove_confs(files)
 end
 
 function action_remove()
-	local body = http.content() or ''
-	local data = nil
-	local ct = http.getenv('CONTENT_TYPE') or ''
-	if body and #body > 0 and ct:find('application/json', 1, true) then
-		data = json.parse(body)
-	end
-	local pkg = data and data.package or http.formvalue('package')
-	local purge = false
-	if data and data.purge ~= nil then
-		purge = data.purge and true or false
-	else
-		purge = http.formvalue('purge') == '1'
-	end
-	local force = false
-	if data and data.force ~= nil then
-		force = data.force and true or false
-	else
-		force = http.formvalue('force') == '1'
-	end
+    -- DEBUG: 打印所有可查参数
+    local dbg_vals = {
+        method = http.getenv("REQUEST_METHOD"),
+        content_type = http.getenv("CONTENT_TYPE"),
+        form_package = http.formvalue('package'),
+        form_purge = http.formvalue('purge'),
+        form_force = http.formvalue('force'),
+        body = http.content()
+    }
+    nixio.syslog('err', '[uninstall-debug] ' .. require('luci.jsonc').stringify(dbg_vals))
 
-	if not pkg or pkg == '' then
-		return json_response({ ok = false, message = 'Missing package' }, 400)
-	end
+    -- 兼容各种参数来源和 POST/GET混合
+    local pkg = http.formvalue('package')
+    local purge = http.formvalue('purge')
+    local force = http.formvalue('force')
 
-	local files
-	if purge then
-		files = collect_conffiles(pkg)
-	end
+    -- 尝试解析 body json
+    local ct = http.getenv('CONTENT_TYPE') or ''
+    if (not pkg or pkg == '') and ct:find('application/json', 1, true) then
+        local body = http.content()
+        local data = nil
+        pcall(function() data = require('luci.jsonc').parse(body or '') end)
+        if data then
+            pkg = pkg or data.package
+            purge = purge or data.purge
+            force = force or data.force
+        end
+    end
 
-	local logs = {}
-	local function logln(s) logs[#logs+1] = s end
-	local function run(cmd)
-		local out = sys.exec(cmd .. " 2>&1") or ''
-		logln('$ ' .. cmd)
-		if #out > 0 then logln(out) end
-		return out
-	end
+    purge = (purge == true or purge == "1")
+    force = (force == true or force == "1")
 
-	-- derive short name from luci-app-xxx
-	local short = pkg:gsub('^luci%-app%-','')
+    if not pkg or pkg == '' then
+        return json_response({ ok = false, message = 'Missing package', debug = dbg_vals }, 400)
+    end
 
-	-- 1) stop and disable service if exists
-	run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q stop || true", short, short))
-	run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q disable || true", short, short))
+    local files
+    if purge then
+        files = collect_conffiles(pkg)
+    end
 
-	-- 2) resolve related package names
-	local related = {}
-	-- meta
-	related[#related+1] = 'app-meta-' .. short
-	-- i18n variants discovered dynamically
-	local i18n_list = sys.exec(string.format("opkg list-installed | awk '{print $1}' | grep '^luci%-i18n%-%s%-' || true", short)) or ''
-	for line in i18n_list:gmatch("[^\n]+") do related[#related+1] = line end
-	-- main luci-app and base pkg
-	related[#related+1] = pkg
-	related[#related+1] = short
+    local logs = {}
+    local function logln(s) logs[#logs+1] = s end
+    local function run(cmd)
+        local out = sys.exec(cmd .. " 2>&1") or ''
+        logln('$ ' .. cmd)
+        if #out > 0 then logln(out) end
+        return out
+    end
 
-	-- 3) opkg remove in order with force flags if requested; retry with --force-remove if prerm fails
-	local any_removed = false
-	for _, name in ipairs(related) do
-		if name and #name > 0 then
-			local flags = "--autoremove"
-			if force then flags = "--force-removal-of-dependent-packages --force-depends " .. flags end
-			local out = run(string.format("opkg remove %s '%s'", flags, name))
-			local low = out:lower()
-			if low:match('prerm script failed') then
-				-- retry with --force-remove
-				out = run(string.format("opkg remove --force-remove %s '%s'", flags, name))
-				low = out:lower()
-			end
-			if low:match('removing') or low:match('removed') then any_removed = true end
-		end
-	end
+    -- derive short name from luci-app-xxx
+    local short = pkg:gsub('^luci%-app%-','')
 
-	-- 4) purge residual configs/files if requested
-	local removed_confs = {}
-	if purge then
-		removed_confs = remove_confs(files)
-		local cfg1 = '/etc/config/' .. short
-		local cfg2 = '/etc/config/' .. pkg
-		if fs.stat(cfg1) then fs.remove(cfg1); removed_confs[#removed_confs+1] = cfg1 end
-		if fs.stat(cfg2) then fs.remove(cfg2); removed_confs[#removed_confs+1] = cfg2 end
-		-- remove init scripts and rc.d symlinks
-		run(string.format("rm -f /etc/init.d/%q; find /etc/rc.d -maxdepth 1 -type l -name '*%s*' -exec rm -f {} + || true", short, short))
-		-- remove LuCI pages (controller/model/view/resources) best effort
-		run(string.format("rm -f /usr/lib/lua/luci/controller/%s.lua; rm -rf /usr/lib/lua/luci/controller/%s; rm -rf /usr/lib/lua/luci/model/cbi/%s; rm -rf /usr/lib/lua/luci/view/%s || true", short, short, short, short))
-		-- remove common runtime leftovers
-		run(string.format("rm -rf /tmp/%s* /var/run/%s* /var/log/%s* || true", short, short, short))
-		-- remove binaries with same name if any
-		run(string.format("rm -f /usr/bin/%s* /usr/sbin/%s* || true", short, short))
-	end
+    -- 1) stop and disable service if exists
+    run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q stop || true", short, short))
+    run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q disable || true", short, short))
 
-	-- 5) refresh LuCI cache and reload services
-	run("rm -f /tmp/luci-indexcache; rm -rf /tmp/luci-modulecache/* || true")
-	run("[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload || true")
-	run("[ -x /etc/init.d/nginx ] && /etc/init.d/nginx reload || true")
+    -- 2) resolve related package names
+    local related = {}
+    -- meta
+    related[#related+1] = 'app-meta-' .. short
+    -- i18n variants discovered dynamically
+    local i18n_list = sys.exec(string.format("opkg list-installed | awk '{print $1}' | grep '^luci%-i18n%-%s%-' || true", short)) or ''
+    for line in i18n_list:gmatch("[^\n]+") do related[#related+1] = line end
+    -- main luci-app and base pkg
+    related[#related+1] = pkg
+    related[#related+1] = short
 
-	local success = any_removed
-	json_response({
-		ok = success,
-		message = table.concat(logs, '\n'),
-		removed_configs = removed_confs
-	})
+    -- 3) opkg remove in order with force flags if requested; retry with --force-remove if prerm fails
+    local any_removed = false
+    for _, name in ipairs(related) do
+        if name and #name > 0 then
+            local flags = "--autoremove"
+            if force then flags = "--force-removal-of-dependent-packages --force-depends " .. flags end
+            local out = run(string.format("opkg remove %s '%s'", flags, name))
+            local low = out:lower()
+            if low:match('prerm script failed') then
+                -- retry with --force-remove
+                out = run(string.format("opkg remove --force-remove %s '%s'", flags, name))
+                low = out:lower()
+            end
+            if low:match('removing') or low:match('removed') then any_removed = true end
+        end
+    end
+
+    -- 4) purge residual configs/files if requested
+    local removed_confs = {}
+    if purge then
+        removed_confs = remove_confs(files)
+        local cfg1 = '/etc/config/' .. short
+        local cfg2 = '/etc/config/' .. pkg
+        if fs.stat(cfg1) then fs.remove(cfg1); removed_confs[#removed_confs+1] = cfg1 end
+        if fs.stat(cfg2) then fs.remove(cfg2); removed_confs[#removed_confs+1] = cfg2 end
+        -- remove init scripts and rc.d symlinks
+        run(string.format("rm -f /etc/init.d/%q; find /etc/rc.d -maxdepth 1 -type l -name '*%s*' -exec rm -f {} + || true", short, short))
+        -- remove LuCI pages (controller/model/view/resources) best effort
+        run(string.format("rm -f /usr/lib/lua/luci/controller/%s.lua; rm -rf /usr/lib/lua/luci/controller/%s; rm -rf /usr/lib/lua/luci/model/cbi/%s; rm -rf /usr/lib/lua/luci/view/%s || true", short, short, short, short))
+        -- remove common runtime leftovers
+        run(string.format("rm -rf /tmp/%s* /var/run/%s* /var/log/%s* || true", short, short, short))
+        -- remove binaries with same name if any
+        run(string.format("rm -f /usr/bin/%s* /usr/sbin/%s* || true", short, short))
+    end
+
+    -- 5) refresh LuCI cache and reload services
+    run("rm -f /tmp/luci-indexcache; rm -rf /tmp/luci-modulecache/* || true")
+    run("[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload || true")
+    run("[ -x /etc/init.d/nginx ] && /etc/init.d/nginx reload || true")
+
+    local success = any_removed
+    json_response({
+        ok = success,
+        message = table.concat(logs, '\n'),
+        removed_configs = removed_confs
+    })
 end
