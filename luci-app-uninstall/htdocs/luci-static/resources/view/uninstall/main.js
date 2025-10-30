@@ -24,31 +24,22 @@ return view.extend({
 		if (options.method === 'POST') {
 			headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=utf-8';
 		}
-		
-		var opts = Object.assign({
-			headers: headers,
-			// LuCI's L.Request uses `data` for url-encoded POST body
-			data: options.body ? new URLSearchParams(options.body).toString() : null
-		}, options);
-		
-		// L.Request wants data as an object, but our controller is simple.
-		// Stringify data to avoid issues.
-		if (opts.method === 'POST' && typeof opts.body === 'object') {
-			var params = new URLSearchParams();
-			for (var key in opts.body) {
-				params.append(key, opts.body[key]);
-			}
-			opts.data = params.toString();
+		var opts = Object.assign({ headers: headers }, options);
+
+		if (opts.data && typeof opts.data === 'object') {
+			// L.Request.request 支持 data 以对象传递，会自动 url-encode
+		} else if (opts.body && typeof opts.body === 'object') {
+			// 兼容调用时用于 body 字段的情况
+			opts.data = opts.body;
 			delete opts.body;
 		}
 
-		return L.Request.request(url, opts)
-			.then(function(res) {
-				if (!res.ok) {
-					throw new Error('HTTP error ' + res.status);
-				}
-				return res.json();
-			});
+		return L.Request.request(url, opts).then(function(res) {
+			if (!res.ok) {
+				throw new Error('HTTP error ' + res.status);
+			}
+			return res.json();
+		});
 	},
 
 	load: function() {
@@ -146,7 +137,7 @@ return view.extend({
 				force: '1'
 			};
 
-			return this._uciRequest(L.url('admin/system/uninstall/remove'), { method: 'POST', body: body })
+			return this._uciRequest(L.url('admin/system/uninstall/remove'), { method: 'POST', data: body })
 				.then(function(res) {
 					println(res.message || '');
 					if (res.ok) {
