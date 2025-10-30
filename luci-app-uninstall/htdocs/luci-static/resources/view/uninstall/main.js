@@ -14,9 +14,18 @@ return view.extend({
 	_httpJson: function(url, options) {
 		options = options || {};
 		if (L && L.Request && typeof L.Request.request === 'function') {
-			// LuCI's L.Request expects payload in `data`, not `body`
+			// LuCI's L.Request expects payload in `data` (object). Convert body if provided.
 			var opts = Object.assign({}, options);
-			if (opts.body != null) { opts.data = opts.body; delete opts.body; }
+			if (opts.body != null && opts.data == null) {
+				if (typeof opts.body === 'string') {
+					var obj = {};
+					opts.body.replace(/([^=&]+)=([^&]*)/g, function(_, k, v){ obj[decodeURIComponent(k)] = decodeURIComponent(v); });
+					opts.data = obj;
+					delete opts.body;
+				} else if (typeof opts.body === 'object') {
+					opts.data = opts.body; delete opts.body;
+				}
+			}
 			return L.Request.request(url, opts).then(function(res){ return res.json(); });
 		}
 		if (typeof fetch === 'function') {
