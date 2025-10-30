@@ -152,29 +152,77 @@ function action_remove()
 		files = collect_conffiles(pkg)
 	end
 
-	-- try stopping init script if exists
-	sys.call(string.format("/etc/init.d/%q stop >/dev/null 2>&1", pkg))
+	local logs = {}
+	local function logln(s) logs[#logs+1] = s end
+	local function run(cmd)
+		local out = sys.exec(cmd .. " 2>&1") or ''
+		logln('$ ' .. cmd)
+		if #out > 0 then logln(out) end
+		return out
+	end
 
-	-- remove package (honor force); preserve output for UI)
-	local cmd = string.format("opkg remove %s --autoremove '%s' 2>&1", (force and '--force-removal-of-dependent-packages --force-depends' or ''), pkg)
-	local output = sys.exec(cmd)
-	local lower = (output or ''):lower()
-	local success = (lower:match('removing') or lower:match('ok') or lower:match('removed')) and (not lower:match('failed'))
+	-- derive short name from luci-app-xxx
+	local short = pkg:gsub('^luci%-app%-','')
 
-	local removed_confs = {}
-	if purge then
-		removed_confs = remove_confs(files)
-		-- best-effort: also remove /etc/config/<pkg> if exists
-		local cfg = '/etc/config/' .. pkg
-		if fs.stat(cfg) then
-			fs.remove(cfg)
-			removed_confs[#removed_confs+1] = cfg
+	-- 1) stop and disable service if exists
+	run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q stop || true", short, short))
+	run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q disable || true", short, short))
+
+	-- 2) resolve related package names
+	local related = {}
+	-- meta
+	related[#related+1] = 'app-meta-' .. short
+	-- i18n variants discovered dynamically
+	local i18n_list = sys.exec(string.format("opkg list-installed | awk '{print $1}' | grep '^luci%-i18n%-%s%-' || true", short)) or ''
+	for line in i18n_list:gmatch("[^\n]+") do related[#related+1] = line end
+	-- main luci-app and base pkg
+	related[#related+1] = pkg
+	related[#related+1] = short
+
+	-- 3) opkg remove in order with force flags if requested; retry with --force-remove if prerm fails
+	local any_removed = false
+	for _, name in ipairs(related) do
+		if name and #name > 0 then
+			local flags = "--autoremove"
+			if force then flags = "--force-removal-of-dependent-packages --force-depends " .. flags end
+			local out = run(string.format("opkg remove %s '%s'", flags, name))
+			local low = out:lower()
+			if low:match('prerm script failed') then
+				-- retry with --force-remove
+				out = run(string.format("opkg remove --force-remove %s '%s'", flags, name))
+				low = out:lower()
+			end
+			if low:match('removing') or low:match('removed') then any_removed = true end
 		end
 	end
 
+	-- 4) purge residual configs/files if requested
+	local removed_confs = {}
+	if purge then
+		removed_confs = remove_confs(files)
+		local cfg1 = '/etc/config/' .. short
+		local cfg2 = '/etc/config/' .. pkg
+		if fs.stat(cfg1) then fs.remove(cfg1); removed_confs[#removed_confs+1] = cfg1 end
+		if fs.stat(cfg2) then fs.remove(cfg2); removed_confs[#removed_confs+1] = cfg2 end
+		-- remove init scripts and rc.d symlinks
+		run(string.format("rm -f /etc/init.d/%q; find /etc/rc.d -maxdepth 1 -type l -name '*%s*' -exec rm -f {} + || true", short, short))
+		-- remove LuCI pages (controller/model/view/resources) best effort
+		run(string.format("rm -f /usr/lib/lua/luci/controller/%s.lua; rm -rf /usr/lib/lua/luci/controller/%s; rm -rf /usr/lib/lua/luci/model/cbi/%s; rm -rf /usr/lib/lua/luci/view/%s || true", short, short, short, short))
+		-- remove common runtime leftovers
+		run(string.format("rm -rf /tmp/%s* /var/run/%s* /var/log/%s* || true", short, short, short))
+		-- remove binaries with same name if any
+		run(string.format("rm -f /usr/bin/%s* /usr/sbin/%s* || true", short, short))
+	end
+
+	-- 5) refresh LuCI cache and reload services
+	run("rm -f /tmp/luci-indexcache; rm -rf /tmp/luci-modulecache/* || true")
+	run("[ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd reload || true")
+	run("[ -x /etc/init.d/nginx ] && /etc/init.d/nginx reload || true")
+
+	local success = any_removed
 	json_response({
 		ok = success,
-		message = output or '',
+		message = table.concat(logs, '\n'),
 		removed_configs = removed_confs
 	})
 end
