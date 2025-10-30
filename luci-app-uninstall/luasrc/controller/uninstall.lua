@@ -135,6 +135,12 @@ function action_remove()
 	else
 		purge = http.formvalue('purge') == '1'
 	end
+	local force = false
+	if data and data.force ~= nil then
+		force = data.force and true or false
+	else
+		force = http.formvalue('force') == '1'
+	end
 
 	if not pkg or pkg == '' then
 		return json_response({ ok = false, message = 'Missing package' }, 400)
@@ -148,10 +154,11 @@ function action_remove()
 	-- try stopping init script if exists
 	sys.call(string.format("/etc/init.d/%q stop >/dev/null 2>&1", pkg))
 
-	-- remove package
-	local cmd = string.format("opkg remove --autoremove '%s' 2>&1", pkg)
+	-- remove package (honor force); preserve output for UI)
+	local cmd = string.format("opkg remove %s --autoremove '%s' 2>&1", (force and '--force-removal-of-dependent-packages --force-depends' or ''), pkg)
 	local output = sys.exec(cmd)
-	local success = (output and not output:lower():match('not installed')) and (not output:lower():match('failed'))
+	local lower = (output or ''):lower()
+	local success = (lower:match('removing') or lower:match('ok') or lower:match('removed')) and (not lower:match('failed'))
 
 	local removed_confs = {}
 	if purge then

@@ -105,7 +105,8 @@ return view.extend({
 
 				var token = (L.env && (L.env.token || L.env.csrf_token)) || '';
 				var removeUrl = L.url('admin/system/uninstall/remove') + (token ? ('?token=' + encodeURIComponent(token)) : '');
-				var formBody = 'package=' + encodeURIComponent(name) + '&purge=' + (purge ? '1' : '0');
+				var force = true; // 默认强制卸载含依赖
+				var formBody = 'package=' + encodeURIComponent(name) + '&purge=' + (purge ? '1' : '0') + '&force=' + (force ? '1' : '0');
 
 				println('> POST ' + removeUrl);
 				println('> body: ' + formBody);
