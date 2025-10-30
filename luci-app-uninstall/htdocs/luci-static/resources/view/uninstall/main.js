@@ -14,7 +14,10 @@ return view.extend({
 	_httpJson: function(url, options) {
 		options = options || {};
 		if (L && L.Request && typeof L.Request.request === 'function') {
-			return L.Request.request(url, options).then(function(res){ return res.json(); });
+			// LuCI's L.Request expects payload in `data`, not `body`
+			var opts = Object.assign({}, options);
+			if (opts.body != null) { opts.data = opts.body; delete opts.body; }
+			return L.Request.request(url, opts).then(function(res){ return res.json(); });
 		}
 		if (typeof fetch === 'function') {
 			options.credentials = 'include';
