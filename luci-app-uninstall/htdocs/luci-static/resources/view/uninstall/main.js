@@ -119,7 +119,12 @@ return view.extend({
 		var title = _('Uninstall Package');
 		var desc = purge ? _('Are you sure you want to uninstall "%s" and remove its configuration files?').format(name) : _('Are you sure you want to uninstall "%s"?').format(name);
 
-		ui.confirm(title, desc, { dangerous: true }).then(function(is_confirmed) {
+		// 关键兼容处理：如无 ui.confirm 用 window.confirm fallback
+		var confirmFn = (ui && typeof ui.confirm === 'function')
+			? ui.confirm
+			: function(title, desc) { return Promise.resolve(window.confirm(title + '\n' + desc)); };
+
+		confirmFn(title, desc).then(function(is_confirmed) {
 			if (!is_confirmed) return;
 
 			ui.showModal(title, [
@@ -138,7 +143,7 @@ return view.extend({
 			var body = {
 				package: name,
 				purge: purge ? '1' : '0',
-				force: '1' // Always force dependencies for luci-app-*
+				force: '1'
 			};
 
 			return this._uciRequest(L.url('admin/system/uninstall/remove'), { method: 'POST', body: body })
