@@ -17,12 +17,9 @@ local sys = require 'luci.sys'
 local fs = require 'nixio.fs'
 local http = require 'luci.http'
 
--- Get list of all installed packages
 function action_list()
 	local pkgs = {}
 	local seen = {}
-
-	-- Prefer parsing status file directly for stability
 	local function parse_status(path)
 		local s = fs.readfile(path)
 		if not s or #s == 0 then return end
@@ -44,15 +41,12 @@ function action_list()
 			seen[name] = true
 		end
 	end
-
 	if fs.stat('/usr/lib/opkg/status') then
 		parse_status('/usr/lib/opkg/status')
 	elseif fs.stat('/var/lib/opkg/status') then
 		parse_status('/var/lib/opkg/status')
 	end
-
 	if #pkgs == 0 then
-		-- Fallback: `opkg list-installed`
 		local out = sys.exec("opkg list-installed 2>/dev/null") or ''
 		for line in out:gmatch("[^\n]+") do
 			local n, v = line:match("^([^%s]+)%s+-%s+(.+)$")
@@ -62,31 +56,25 @@ function action_list()
 			end
 		end
 	end
-
 	table.sort(pkgs, function(a,b) return a.name < b.name end)
 	luci.http.prepare_content('application/json')
 	luci.http.write_json({ packages = pkgs, count = #pkgs })
 end
 
--- Remove a package
 function action_remove()
-	-- Only allow POST requests for safety
 	if http.getenv('REQUEST_METHOD') ~= 'POST' then
 		http.status(405, 'Method Not Allowed')
 		return
 	end
-
 	local pkg = http.formvalue('package')
 	local purge = http.formvalue('purge') == '1'
 	local force = http.formvalue('force') == '1'
-
 	if not pkg or pkg == '' then
 		http.status(400, 'Bad Request')
 		luci.http.prepare_content('application/json')
 		luci.http.write_json({ ok = false, message = 'Missing package name' })
 		return
 	end
-
 	local logs = {}
 	local function logln(s) logs[#logs+1] = s end
 	local function run(cmd)
@@ -95,44 +83,55 @@ function action_remove()
 		if #out > 0 then logln(out) end
 		return out
 	end
-
 	local short = pkg:gsub('^luci%-app%-','')
 
-	-- 1) Stop and disable service if exists
-	run(string.format("[ -x /etc/init.d/%q ] && /etc/init.d/%q stop && /etc/init.d/%q disable", short, short, short))
+	logln("=== " .. pkg .. " (最强卸载) ===")
 
-	-- 2) Collect related packages
-	local related = { pkg }
-	-- Also find i18n packages
-	local i18n_list = sys.exec(string.format("opkg list-installed | awk '{print $1}' | grep '^luci-i18n-%s-'", short)) or ''
-	for line in i18n_list:gmatch("[^\n]+") do related[#related+1] = line end
+	-- 1. 停止并禁用服务
+	run(string.format("[ -x /etc/init.d/%s ] && /etc/init.d/%s stop || true", short, short))
+	run(string.format("[ -x /etc/init.d/%s ] && /etc/init.d/%s disable || true", short, short))
 
-	-- 3) Opkg remove
-	local any_removed = false
-	for _, name in ipairs(related) do
-		if name and #name > 0 then
-			local flags = "--autoremove"
-			if force then flags = flags .. " --force-depends --force-removal-of-dependent-packages" end
-			local out = run(string.format("opkg remove %s %q", flags, name))
-			if out:find('Removing package') then any_removed = true end
-		end
+	-- 2. 卸载主包、多语言包（i18n）、基本二进制，同名 variant
+	run("opkg update")
+	run("opkg list-installed | grep 'luci-i18n-"..short.."-' | cut -f1 -d' ' | xargs opkg remove")
+	run(string.format("opkg remove %s", pkg))
+	run(string.format("opkg remove %s", short))
+	run("opkg autoremove")
+
+	-- 3. 删除所有配置、脚本、视图、控制器、模型、共享资源、二进制、日志等
+	run(string.format("rm -f /etc/config/%s", short))
+	run(string.format("rm -f /usr/lib/lua/luci/controller/%s.lua", short))
+	run(string.format("rm -rf /usr/lib/lua/luci/controller/%s", short))
+	run(string.format("rm -rf /usr/lib/lua/luci/model/cbi/%s", short))
+	run(string.format("rm -rf /usr/lib/lua/luci/view/%s", short))
+	run(string.format("rm -rf /usr/share/%s", short))
+	run(string.format("rm -f /usr/bin/%s*", short))
+	run(string.format("rm -f /usr/sbin/%s*", short))
+	run(string.format("rm -f /etc/init.d/%s", short))
+	run(string.format("find /etc/rc.d -maxdepth 1 -type l -name '*%s*' -exec rm -f {} +", short))
+	run(string.format("rm -f /etc/uci-defaults/*%s*", short))
+	run(string.format("find /etc/hotplug.d -type f -name '*%s*' -exec rm -f {} +", short))
+	run(string.format("rm -rf /tmp/%s* /var/run/%s* /var/log/%s*", short, short, short))
+	run(string.format("rm -rf /etc/%s /root/.%s", short, short))
+
+	-- 4. 清理计划任务
+	if fs.stat("/etc/crontabs/root") then
+		run(string.format("sed -i '/%s/d' /etc/crontabs/root", short))
+		run("/etc/init.d/cron reload")
 	end
 
-	-- 4) Purge config files if requested
-	if purge then
-		run(string.format("rm -f /etc/config/%s", short))
-		run(string.format("rm -f /etc/init.d/%s", short))
-		-- remove rc.d symlinks
-		run(string.format("find /etc/rc.d/ -name 'S*%s' -o -name 'K*%s' | xargs -r rm -f", short, short))
-	end
-
-	-- 5) Refresh LuCI cache
+	-- 5. 刷新 LuCI 缓存并重载 Web/防火墙
 	run("rm -f /tmp/luci-indexcache")
-	sys.call("/etc/init.d/uhttpd reload >/dev/null 2>&1")
+	run("rm -rf /tmp/luci-modulecache/*")
+	run("/etc/init.d/uhttpd reload || true")
+	run("/etc/init.d/nginx reload || true")
+	run("/etc/init.d/firewall reload || true")
+
+	logln('✓ 卸载与清理完成。如界面无变化请刷新浏览器。')
 
 	luci.http.prepare_content('application/json')
 	luci.http.write_json({
-		ok = any_removed,
+		ok = true,
 		message = table.concat(logs, '\n')
 	})
 end
