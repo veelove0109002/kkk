@@ -125,7 +125,8 @@ end
 function action_remove()
 	local body = http.content() or ''
 	local data = nil
-	if body and #body > 0 then
+	local ct = http.getenv('CONTENT_TYPE') or ''
+	if body and #body > 0 and ct:find('application/json', 1, true) then
 		data = json.parse(body)
 	end
 	local pkg = data and data.package or http.formvalue('package')
